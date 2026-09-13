@@ -13,3 +13,12 @@ working in their second language.
 **Say what changed and what happens next.** Those two are what I am reading for.
 
 **Ask me one thing at a time.**
+
+**Give it room.** Blank line between every block. Never stack bold-led
+paragraphs one after another — that is a wall, not a reply.
+
+**Use structure, not bold.** Headings and bullets carry the shape. Bold marks
+one word that matters, not the first four words of every paragraph.
+
+**Short paragraphs.** Two or three lines, then a break. A block longer than
+four lines gets split or becomes a list.
