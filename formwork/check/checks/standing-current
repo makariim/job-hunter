@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Check: the standing brief is filled in, and not older than the record.
+
+    standing-current <directory>
+
+The standing brief is `docs/standing.md`. It says what we are building, where
+we are now, what is decided, what is open and what is next. A new conversation
+reads it instead of being told the story again.
+
+CATCHES  A standing brief left behind. A decision was recorded on Tuesday, the
+         brief still describes Monday, and the next conversation starts from
+         Monday with complete confidence. Nothing about that looks wrong on
+         screen, which is why a program has to say it.
+
+         Also a template copied and never filled in, which reads like a
+         standing brief and carries no state at all.
+
+What it cannot do is tell whether what you wrote is true. Nothing can. It
+checks the date, the headings and the empty bullets, and those are enough to
+catch the way this file actually fails.
+
+The comparison uses the dates written inside the files, not the times on disk.
+A clone rewrites every file time to the moment of the clone, so file times
+would say every project was current.
+
+Exit status:
+    0   there is no standing brief, or it is filled in and not behind
+    1   it is behind, or unfilled, and the problem is named
+    2   the check could not run
+"""
+import datetime
+import os
+import re
+import sys
+
+STANDING = os.path.join("docs", "standing.md")
+DECISIONS = os.path.join("docs", "decisions")
+ROUNDS = os.path.join("docs", "rounds")
+
+DATE = re.compile(r"^\s*(?:updated|date)\s*:\s*[\"']?(\d{4})-(\d{2})-(\d{2})",
+                  re.M | re.I)
+UPDATED = re.compile(r"^\s*updated\s*:\s*[\"']?(\d{4})-(\d{2})-(\d{2})",
+                     re.M | re.I)
+HEADING = re.compile(r"^##\s+(.+?)\s*$", re.M)
+# A bullet with nothing after it. That is the template, unfilled.
+EMPTY_BULLET = re.compile(r"^\s*(?:[-*+]|\d+\.)\s*$", re.M)
+
+# A fenced block is an example, not the document saying something. An audit
+# wrote a standing brief whose entire body was "nothing has been written here
+# yet", with the filled-in template quoted underneath in a fence, and this
+# check passed it: the date, all six headings and their text were found inside
+# the fence. The same blindness rejected an honest brief that quoted a diff,
+# because a removed blank line looked like an empty bullet.
+FENCE = re.compile(r"^[ \t]*(?:```|~~~).*?^[ \t]*(?:```|~~~)[ \t]*$",
+                   re.M | re.S)
+
+
+def without_fences(text):
+    """The document's own words. Fenced blocks become blank lines, so every
+    line number a person might count still lines up."""
+    return FENCE.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+
+# In order. The first two have to say something; the rest may be empty, because
+# a project with nothing open and nothing abandoned is a real state.
+REQUIRED = [
+    "what we are building",
+    "where we are now",
+    "what is decided",
+    "what is open",
+    "what is next",
+    "what we tried and stopped",
+]
+MUST_SAY_SOMETHING = 2
+
+# One day of slack, because the person writing the brief may be a day ahead of
+# this machine. More than that is a typed date, not a timezone.
+SLACK = datetime.timedelta(days=1)
+
+# Paths the runner has told this check to stay out of. The kit's own fixtures
+# are wrong on purpose. Resolved against the directory being checked, not
+# against wherever the person happened to be standing: a relative exclude used
+# to mean two different places depending on the caller.
+def excluded_paths(root):
+    out = []
+    for p in os.environ.get("FORMWORK_EXCLUDE", "").split(os.pathsep):
+        if not p:
+            continue
+        out.append(os.path.realpath(p if os.path.isabs(p)
+                                    else os.path.join(root, p)))
+    return out
+
+
+def is_excluded(path, excludes):
+    a = os.path.realpath(path)
+    return any(a == e or a.startswith(e + os.sep) for e in excludes)
+
+
+
+def read(path):
+    return open(path, encoding="utf-8", errors="replace").read()
+
+
+def as_date(m):
+    """A matched date, or None if those three numbers are not a real day."""
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def record_files(root):
+    """Every decision record and round record, as relative paths.
+
+    Both are walked, not listed. Listing `docs/decisions` flat meant a record
+    moved one folder deeper vanished, and the check then said it was ahead of
+    all 0 records. Archiving decisions by year is the ordinary thing that does
+    it, and the success line made the blindness look like coverage.
+    """
+    out = []
+    excludes = excluded_paths(root)
+    for sub in (DECISIONS, ROUNDS):
+        d = os.path.join(root, sub)
+        if not os.path.isdir(d) or is_excluded(d, excludes):
+            continue
+        for base, dirs, files in os.walk(d):
+            dirs.sort()
+            for fn in sorted(files):
+                full = os.path.join(base, fn)
+                if not fn.endswith(".md") or fn.upper().startswith("README"):
+                    continue
+                if is_excluded(full, excludes):
+                    continue
+                out.append(os.path.relpath(full, root))
+    return sorted(out)
+
+
+def sections(text):
+    """Heading to the text under it, lowercased headings, in order."""
+    parts = re.split(HEADING, text)
+    out = []
+    for i in range(1, len(parts), 2):
+        out.append((parts[i].strip().lower(), parts[i + 1]))
+    return out
+
+
+def first_of_each(pairs):
+    """The first time each heading appears, not the last.
+
+    Building a plain dictionary let an appendix quoting the blank template
+    erase the filled section above it, and the check then said two required
+    sections were empty when both were written.
+    """
+    out = {}
+    for heading, body in pairs:
+        out.setdefault(heading, body)
+    return out
+
+
+def has_words(body):
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = re.sub(r"^(?:[-*+]|\d+\.)\s*", "", line).strip()
+        if line:
+            return True
+    return False
+
+
+def main(argv):
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    if not args:
+        print("usage: standing-current <directory>", file=sys.stderr)
+        return 2
+    root = args[0]
+    if not os.path.isdir(root):
+        print("ERROR: not a directory: %s" % root, file=sys.stderr)
+        return 2
+
+    path = os.path.join(root, STANDING)
+    if not os.path.isfile(path):
+        print("no %s, nothing claimed" % STANDING)
+        return 0
+
+    try:
+        text = read(path)
+    except OSError as e:
+        print("ERROR: cannot read %s: %s" % (STANDING, e), file=sys.stderr)
+        return 2
+
+    problems = []
+    # Everything below reads the document's own words. A fenced example is
+    # somebody showing you the shape of the file, not the file saying it.
+    text = without_fences(text)
+
+    m = UPDATED.search(text)
+    updated = as_date(m) if m else None
+    if m and updated is None:
+        problems.append("%s — 'updated:' is not a real date: %s"
+                        % (STANDING, m.group(0).strip()))
+    elif not m:
+        problems.append("%s — no 'updated: YYYY-MM-DD' line, so nothing can "
+                        "tell whether it is behind" % STANDING)
+    elif updated > datetime.date.today() + SLACK:
+        problems.append("%s — dated %s, which has not happened yet"
+                        % (STANDING, updated))
+
+    found = [h for h, _b in sections(text)]
+    bodies = first_of_each(sections(text))
+    for i, want in enumerate(REQUIRED):
+        if want not in found:
+            problems.append("%s — no '## %s' heading" % (STANDING, want))
+        elif i < MUST_SAY_SOMETHING and not has_words(bodies[want]):
+            problems.append("%s — '%s' is empty, and that one has to say "
+                            "something" % (STANDING, want))
+
+    if EMPTY_BULLET.search(text):
+        n = len(EMPTY_BULLET.findall(text))
+        problems.append("%s — %d bullet(s) with nothing after them. Fill them "
+                        "in or delete them" % (STANDING, n))
+
+    # Behind the record.
+    if updated is not None:
+        for rel in record_files(root):
+            try:
+                body = read(os.path.join(root, rel))
+            except OSError as e:
+                # A record that cannot be read used to be skipped, and still
+                # counted in the "ahead of all N record(s)" line. One chmod
+                # turned a red gate green. A check that cannot look says so.
+                print("ERROR: cannot read %s: %s" % (rel, e), file=sys.stderr)
+                return 2
+            dm = DATE.search(without_fences(body))
+            when = as_date(dm) if dm else None
+            if when is None:
+                problems.append("%s — no readable date, so nothing can tell "
+                                "whether the standing brief is behind it" % rel)
+            elif when > updated:
+                problems.append("%s is dated %s. The standing brief says %s, "
+                                "so it does not know about this one"
+                                % (rel, when, updated))
+
+    if problems:
+        print("%d problem(s) with the standing brief" % len(problems))
+        for p in problems:
+            print("  %s" % p)
+        return 1
+
+    n = len(record_files(root))
+    print("standing brief filled in, dated %s, ahead of all %d record(s)"
+          % (updated, n))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

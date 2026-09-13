@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Check: if a runtime is declared, its guard is actually wired up.
+
+    guard-wired <directory>
+
+CATCHES  A project that believes it has a boundary and does not. The rule is
+         written down, the adapter exists in the repository, and nothing
+         connects the two. Everything looks right and nothing refuses.
+
+A project that declares no runtime is not failed. It has made no claim.
+
+Exit status:
+    0   no runtime declared, or the declared runtime is wired
+    1   a runtime is declared and its wiring is missing
+    2   the check could not run
+"""
+import json
+import os
+import re
+import sys
+
+# Where each runtime keeps its hook configuration, relative to the project.
+WIRING = {
+    "claude-code": ".claude/settings.json",
+    "codex":       ".codex/hooks.json",
+    "cursor":      ".cursor/hooks.json",
+    "gemini-cli":  ".gemini/settings.json",
+}
+# All three guards, not one. A settings file with the other two deleted used
+# to report "declared and wired".
+MARKERS = ("formwork/guard/git-boundary",
+           "formwork/guard/protected-files",
+           "formwork/guard/quality-gate")
+MARKER = MARKERS[0]
+
+# Events that actually fire before a tool runs, or at the end of a turn.
+# Anything else is a place to park a hook so it never happens.
+LIVE_EVENTS = {"PreToolUse", "Stop", "SubagentStop", "preToolUse",
+               "beforeShellExecution", "BeforeTool"}
+
+# A matcher that can match a real tool name. "zzz-never-matches" cannot.
+MATCHES_A_TOOL = re.compile(
+    r"(?i)\b(Bash|Write|Edit|NotebookEdit|Task|WebFetch|Read|Glob|Grep|\*|\.\*)\b")
+
+
+def declared_runtime(root):
+    config = os.path.join(root, ".formwork.toml")
+    if not os.path.exists(config):
+        return None
+    try:
+        text = open(config, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return None
+    # Accept the key wherever it sits. The configuration grew a [bindings]
+    # section and three documents disagreed about where runtime lived; a
+    # reader that only understood one of them broke the other.
+    m = re.search(r'^\s*runtime\s*=\s*["\']([^"\']+)["\']', text, re.M)
+    return m.group(1) if m else None
+
+
+def main(argv):
+    if len(argv) < 2:
+        print("usage: guard-wired <directory>", file=sys.stderr)
+        return 2
+    root = argv[1]
+    if not os.path.isdir(root):
+        print("ERROR: not a directory: %s" % root, file=sys.stderr)
+        return 2
+
+    runtime = declared_runtime(root)
+    if runtime is None:
+        print("no runtime declared, nothing claimed")
+        return 0
+    if runtime not in WIRING:
+        print("runtime '%s' is not one this kit knows how to wire" % runtime)
+        print("  known: %s" % ", ".join(sorted(WIRING)))
+        return 1
+
+    path = os.path.join(root, WIRING[runtime])
+    if not os.path.exists(path):
+        print("runtime '%s' is declared, but %s does not exist"
+              % (runtime, WIRING[runtime]))
+        return 1
+    try:
+        text = open(path, encoding="utf-8", errors="ignore").read()
+    except OSError as e:
+        print("ERROR: cannot read %s: %s" % (path, e), file=sys.stderr)
+        return 2
+    # A bare substring test passed when a guard's path appeared anywhere at
+    # all — including inside a key called "_disabled_note", and including
+    # inside an echo. The path must START a command value.
+    # The value may contain escaped quotes: "\"$CLAUDE_PROJECT_DIR\"/formwork/..."
+    # A path inside a "command" string was not enough. Every guard was moved
+    # to an event that never fires, with a matcher that matches nothing, and
+    # this check still said wired. It now reads the shape, not just the text.
+    def wired_for(marker):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            # Not JSON. Fall back to the text test, which is all the TOML
+            # runtimes can be given today.
+            return marker in text
+
+        hooks = data.get("hooks")
+        if not isinstance(hooks, dict):
+            return False
+        for event, entries in hooks.items():
+            if event not in LIVE_EVENTS:
+                continue
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                matcher = entry.get("matcher")
+                if matcher is not None and not MATCHES_A_TOOL.search(str(matcher)):
+                    continue
+                for h in entry.get("hooks") or []:
+                    if not isinstance(h, dict):
+                        continue
+                    cmd = str(h.get("command", ""))
+                    if marker in cmd and not cmd.strip().startswith("echo"):
+                        return True
+        return False
+
+    missing = [m for m in MARKERS if not wired_for(m)]
+    if missing:
+        print("runtime '%s' is declared and %s exists, but it does not "
+              "invoke:" % (runtime, WIRING[runtime]))
+        for m in missing:
+            print("  %s" % m)
+        return 1
+
+    print("runtime '%s' declared and wired in %s" % (runtime, WIRING[runtime]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
